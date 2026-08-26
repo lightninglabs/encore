@@ -1,0 +1,96 @@
+name: encore
+description: >-
+  Re-run the failed jobs of a completed workflow run, but only when they were
+  lost to infrastructure (spot preemption, OOM-kill, node-pressure eviction)
+  rather than to a real failure.
+
+inputs:
+  run_id:
+    description: ID of the completed workflow run to examine.
+    required: true
+  max_attempts:
+    description: >-
+      Give up once run_attempt reaches this number. Also the infinite-loop
+      guard, since every re-run emits another workflow_run:completed event.
+    required: false
+    default: '3'
+  dry_run:
+    description: Log the verdict but never call rerun-failed-jobs.
+    required: false
+    default: 'false'
+  extra_patterns:
+    description: >-
+      Additional case-insensitive regexes, one per line, that also mark a job as
+      an infrastructure failure. Blank lines and #-comments are ignored.
+    required: false
+    default: ''
+  rerun_all_fallback:
+    description: >-
+      If rerun-failed-jobs is rejected because no candidate job ended "failure"
+      (every one was cancelled), re-run the whole run instead — passed jobs
+      included. Off by default: it costs a full re-run.
+    required: false
+    default: 'false'
+  github_token:
+    description: >-
+      Token used for the API calls. Needs `actions: write` (rerun-failed-jobs)
+      and `checks: read` (annotations).
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  decision:
+    description: >-
+      One of retried, retried_all, rerun_rejected, dry_run, attempt_cap,
+      no_candidate_jobs, genuine_failure, no_infra_evidence, run_incomplete.
+    value: ${{ steps.encore.outputs.decision }}
+  retried:
+    description: '"true" if a re-run was started.'
+    value: ${{ steps.encore.outputs.retried }}
+  examined_attempt:
+    description: The attempt whose jobs were classified.
+    value: ${{ steps.encore.outputs.examined_attempt }}
+  next_attempt:
+    description: The attempt that was started, empty if none was.
+    value: ${{ steps.encore.outputs.next_attempt }}
+  candidate_jobs:
+    description: Failed or cancelled jobs found in the examined attempt.
+    value: ${{ steps.encore.outputs.candidate_jobs }}
+  infra_jobs:
+    description: How many of those were classified as infrastructure failures.
+    value: ${{ steps.encore.outputs.infra_jobs }}
+
+runs:
+  using: composite
+  steps:
+    - id: encore
+      uses: actions/github-script@v7
+      env:
+        # Passed through the environment rather than interpolated into the
+        # script body, so nothing in an input can become code.
+        ENCORE_ACTION_PATH: ${{ github.action_path }}
+        ENCORE_RUN_ID: ${{ inputs.run_id }}
+        ENCORE_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        ENCORE_DRY_RUN: ${{ inputs.dry_run }}
+        ENCORE_EXTRA_PATTERNS: ${{ inputs.extra_patterns }}
+        ENCORE_RERUN_ALL_FALLBACK: ${{ inputs.rerun_all_fallback }}
+      with:
+        github-token: ${{ inputs.github_token || github.token }}
+        script: |
+          const { encore } = require(`${process.env.ENCORE_ACTION_PATH}/src/encore.js`);
+          return await encore({
+            github,
+            context,
+            core,
+            inputs: {
+              run_id: process.env.ENCORE_RUN_ID,
+              max_attempts: process.env.ENCORE_MAX_ATTEMPTS,
+              dry_run: process.env.ENCORE_DRY_RUN,
+              extra_patterns: process.env.ENCORE_EXTRA_PATTERNS,
+              rerun_all_fallback: process.env.ENCORE_RERUN_ALL_FALLBACK,
+            },
+          });
+
+branding:
+  icon: rotate-ccw
+  color: purple

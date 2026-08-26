@@ -1,0 +1,108 @@
+# GENERATED FILE — do not edit.
+#
+# Source:    src/encore.js
+# Template:  templates/retry.yml.tmpl
+# Regenerate: npm run build   (npm run verify checks it is in sync)
+#
+# The logic is inlined rather than `uses:`-referenced because a called reusable
+# workflow resolves relative `uses: ./...` paths against the *caller's* repo, so
+# it cannot load an action from the repo it lives in without hardcoding that
+# repo's slug. Inlining keeps this file portable to any org.
+
+name: encore
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: ID of the completed workflow run to examine.
+        required: true
+        type: string
+      max_attempts:
+        description: Give up once run_attempt reaches this number.
+        required: false
+        type: number
+        default: 3
+      dry_run:
+        description: Log the verdict but never call rerun-failed-jobs.
+        required: false
+        type: boolean
+        default: false
+      rerun_all_fallback:
+        description: >-
+          If rerun-failed-jobs is rejected because no candidate job ended
+          "failure" (every one was cancelled), re-run the whole run instead —
+          passed jobs included. Off by default: it costs a full re-run.
+        required: false
+        type: boolean
+        default: false
+      extra_patterns:
+        description: >-
+          Additional case-insensitive regexes, one per line, that also mark a
+          job as an infrastructure failure. Blank lines and #-comments ignored.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      token:
+        description: >-
+          Optional PAT, for when the caller's GITHUB_TOKEN cannot be granted
+          `actions: write`. Defaults to the caller-scoped GITHUB_TOKEN.
+        required: false
+    outputs:
+      decision:
+        description: >-
+          One of retried, retried_all, rerun_rejected, dry_run, attempt_cap,
+          no_candidate_jobs, genuine_failure, no_infra_evidence, run_incomplete.
+        value: ${{ jobs.maybe-retry.outputs.decision }}
+      retried:
+        description: '"true" if a re-run was started.'
+        value: ${{ jobs.maybe-retry.outputs.retried }}
+      examined_attempt:
+        description: The attempt whose jobs were classified.
+        value: ${{ jobs.maybe-retry.outputs.examined_attempt }}
+      next_attempt:
+        description: The attempt that was started, empty if none was.
+        value: ${{ jobs.maybe-retry.outputs.next_attempt }}
+
+permissions:
+  actions: write   # rerun-failed-jobs
+  checks: read     # list annotations
+
+jobs:
+  maybe-retry:
+    # Deliberately NOT the spot pool: the retrier must not be preemptible.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      decision: ${{ steps.encore.outputs.decision }}
+      retried: ${{ steps.encore.outputs.retried }}
+      examined_attempt: ${{ steps.encore.outputs.examined_attempt }}
+      next_attempt: ${{ steps.encore.outputs.next_attempt }}
+    steps:
+      - id: encore
+        uses: actions/github-script@v7
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script body, so nothing in an input can become code.
+          ENCORE_RUN_ID: ${{ inputs.run_id }}
+          ENCORE_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          ENCORE_DRY_RUN: ${{ inputs.dry_run }}
+          ENCORE_EXTRA_PATTERNS: ${{ inputs.extra_patterns }}
+          ENCORE_RERUN_ALL_FALLBACK: ${{ inputs.rerun_all_fallback }}
+        with:
+          github-token: ${{ secrets.token || github.token }}
+          script: |
+            {{ENCORE_SCRIPT}}
+            return await encore({
+              github,
+              context,
+              core,
+              inputs: {
+                run_id: process.env.ENCORE_RUN_ID,
+                max_attempts: process.env.ENCORE_MAX_ATTEMPTS,
+                dry_run: process.env.ENCORE_DRY_RUN,
+                extra_patterns: process.env.ENCORE_EXTRA_PATTERNS,
+                rerun_all_fallback: process.env.ENCORE_RERUN_ALL_FALLBACK,
+              },
+            });

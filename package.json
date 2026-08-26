@@ -1,0 +1,24 @@
+{
+  "name": "encore",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Re-runs GitHub Actions jobs lost to spot preemption, not jobs that genuinely failed.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lightninglabs/encore.git"
+  },
+  "homepage": "https://github.com/lightninglabs/encore#readme",
+  "bugs": "https://github.com/lightninglabs/encore/issues",
+  "scripts": {
+    "build": "node scripts/build-workflow.mjs",
+    "verify": "node scripts/build-workflow.mjs --check",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "action.yml",
+    "src"
+  ]
+}

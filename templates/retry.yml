@@ -1,0 +1,44 @@
+# Copy to .github/workflows/encore.yml in an adopting repo.
+#
+#   1. Pin @v1 to the ref you want, and repoint lightninglabs/encore at your own
+#      fork or mirror if you keep one.
+#   2. List the workflows to cover under `workflows:` — these are `name:`
+#      values, not filenames.
+#   3. Merge to the default branch. workflow_run triggers are only honoured
+#      there, so this does nothing on a feature branch.
+name: encore
+
+on:
+  workflow_run:
+    workflows: ["CI", "Integration Tests"]
+    types: [completed]
+
+permissions:
+  actions: write   # rerun-failed-jobs
+  checks: read     # list annotations
+
+# One verdict per run at a time. Two events for the same run would both read a
+# pre-retry state and the loser's rerun call would be rejected.
+concurrency:
+  group: encore-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    # A called workflow can only narrow the caller's token scope, never widen
+    # it, so the permissions above have to be declared here too.
+    # Cancelled runs are in scope too: a preemption does not always land as
+    # `failure`, and a run encore never sees is a hole it cannot report. Safe
+    # because a human-cancelled run carries no infra evidence on any job and so
+    # declines itself as no_infra_evidence — at the cost of one runner-minute.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' ||
+      github.event.workflow_run.conclusion == 'cancelled'
+    uses: lightninglabs/encore/.github/workflows/retry.yml@v1
+    with:
+      run_id: ${{ github.event.workflow_run.id }}
+      max_attempts: 3
+      # Add runner-death messages specific to this environment, one regex per
+      # line. The "lost communication with the server" annotation is built in.
+      # extra_patterns: |
+      #   the runner has received a shutdown signal
