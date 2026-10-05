@@ -50,10 +50,13 @@ These shaped the design; do not "simplify" past them.
 |---|---|
 | Detect via check-run annotation text match | The job ID doubles as the check-run ID, so annotations are readable via the API. Good enough. |
 | Treat OOM-kill and node-pressure eviction as retryable too | Accepted by the team. Means no Kubernetes-side signal is required for v1. |
-| Retry the whole run's failed jobs, not individual jobs | `rerun-failed-jobs` is the only available primitive; it preserves already-passing jobs. |
+| Retry the whole run's failed jobs, not individual jobs | `rerun-failed-jobs` is the only available primitive; it preserves already-passing jobs. [†] |
 | Retry only if **every** failed job looks like infra | A run containing one real test failure and one preempted job should not be retried — the real failure will just fail again and we burn double the compute. |
 | Cap with `run_attempt` | Also serves as the infinite-loop guard, since a re-run emits another `workflow_run: completed`. |
 | Orchestrator job runs on GitHub-hosted (or on-demand) runners | The retrier must not itself be preemptible. |
+
+[†] Factually wrong — corrected in §9, "Corrections to the spec". The decision stands; the
+rationale does not.
 
 **Out of scope for v1** (documented in §7 as a follow-up): a Kubernetes-side preemption registry
 that would make the signal exact rather than heuristic.
@@ -242,6 +245,11 @@ mechanism; without it the first retry has the same preemption probability as the
   in the jobs API response (`job.runner_name`, already logged above) and in the
   `workflow_job.completed` webhook. Swapping the regex for a registry lookup makes the signal
   authoritative and stops OOM-kills being silently retried.
+- **Per-job retry mode.** An opt-in mode that calls `actions/jobs/{job_id}/rerun` for each job
+  classified `infra`, rather than `rerun-failed-jobs` for the whole run, so a mixed run recovers its
+  infra jobs instead of being declined. Scope it to callers where the results stand alone
+  (nightlies), settle the `run_attempt` question above first, and measure how often mixed runs
+  actually occur before building it.
 - **Zero-YAML variant.** With that registry plus a `workflow_job.completed` webhook receiver, the
   whole thing can run server-side with no per-repo file at all.
 - **Cordon on interruption notice.** Larger win than retrying: if nodes are cordoned and tainted
@@ -270,6 +278,31 @@ mechanism; without it the first retry has the same preemption probability as the
 ## 9. Implementation notes (added during implementation)
 
 Deltas from the spec above. The spec is unchanged; this section is the diff.
+
+### Corrections to the spec
+
+**`rerun-failed-jobs` is not the only primitive.** Verified 2026-09-16 against the GitHub REST
+documentation: `POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun` re-runs a single job *and
+its dependent jobs*. It backs the "Re-run this job" button in the Actions UI. §3's decisions table
+asserts the opposite, and every downstream doc repeated it.
+
+**The decision to re-run the whole run's failed jobs still holds, for a different reason.** Per-job
+re-run would let encore re-run only the jobs it classified `infra` and leave a genuine failure
+alone. On a merge-gating workflow that buys nothing: the run still ends `failure` because the
+genuine job is still failed, the developer pushes a fix, and that push starts a fresh full run
+which discards the re-run results. The retry is informational ("was anything else broken behind
+those preemptions?"), not unblocking. And in the dominant case — every failed job is infra —
+per-job is simply N API calls where `rerun-failed-jobs` is one, for an identical outcome.
+
+**Where per-job would genuinely pay** is a nightly: independent long jobs, results that matter on
+their own, and no follow-up push coming to re-run them. If `DST Soak` (180 minutes) is preempted
+while `DST Version Skew` genuinely fails, today the soak result is lost until tomorrow.
+
+**Verify before implementing it.** It is undocumented whether a single-job re-run increments
+`run_attempt`. encore's only guard against unbounded spend is `run_attempt >= max_attempts`: if N
+per-job calls create N attempts the cap trips immediately and "attempt" stops meaning anything; if
+they create none, the loop guard disappears. The docs say only that subset re-runs count toward the
+50-re-run-per-run limit.
 
 ### Naming and layout
 
@@ -362,9 +395,22 @@ check in §6.
 
 ### Still open
 
-- Which conclusion ARC preemption actually produces in this cluster (`failure`, `cancelled`, or
-  both), and what message the cancelled variant carries. Run the pod-deletion test in §6
-  criterion 1 and read the `job=` lines.
+- ~~Which conclusion ARC preemption actually produces in this cluster.~~ **Confirmed 2026-08-27**
+  against `lightninglabs/lightning-operator` run 33095003459 (`Docker`, ARC RunnerDeployment
+  `lightninglabs-runnerdeploy-44c8q-wnl7z`): a reclaimed node produces
+  `conclusion=failure`, and the annotation reads
+
+  > The self-hosted runner lost communication with the server. Verify the machine is running and
+  > has a healthy network connection. […]
+
+  Note there is **no runner name in the message** — the spec above quotes it as "The self-hosted
+  runner: `<name>` lost communication", but the live string omits the name entirely. The built-in
+  pattern matches only `lost communication with the server`, so it catches both; a pattern anchored
+  on the runner name would have missed every preemption. Do not "tighten" it. The runner name is
+  read from `job.runner_name`, which is populated, so the §7 registry join key is unaffected.
+
+  Whether a preemption can *also* land as `cancelled` is still unknown; the `cancelled` handling
+  stays as insurance.
 - **Whether `rerun-failed-jobs` will re-run a job that ended `cancelled`.** This is the
   load-bearing unknown: if it refuses, every preemption that lands as `cancelled` needs
   `rerun_all_fallback` (a full re-run) to be retried at all, which changes the cost of the whole

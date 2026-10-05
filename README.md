@@ -38,10 +38,10 @@ worth adopting one layer down, see [Complementary, not alternative](#complementa
 encore lives at [github.com/lightninglabs/encore](https://github.com/lightninglabs/encore). Pin a
 tag — `@v1` below — and pick one of two entry points.
 
-It does not need to be public. For callers in the same org to reference a **private** encore, grant
-them access once on this repo: Settings → Actions → General → Access → *Accessible from
-repositories in the `lightninglabs` organization*. Without it, callers fail to resolve the
-`uses:` line.
+This repo is public, so any caller can reference it as-is — including private repos — with nothing
+to configure. (Were it made private, callers in the same org would need a one-time grant here:
+Settings → Actions → General → Access → *Accessible from repositories in the `lightninglabs`
+organization*.)
 
 ### Reusable workflow (recommended)
 
@@ -275,9 +275,10 @@ with:
 ```
 
 That falls back to `rerun` (the whole run) for that case only, which **re-executes jobs that
-passed** — more expensive, but the only primitive that can start an attempt when GitHub sees no
-failed job. It is off by default, never fires when any candidate ended `failure`, and reports
-`retried_all` when it does.
+passed** — more expensive, but it does start an attempt when GitHub sees no failed job to re-run.
+It is off by default, never fires when any candidate ended `failure`, and reports `retried_all`
+when it does. (Re-running those cancelled jobs individually via `actions/jobs/{job_id}/rerun` may
+also work and would be cheaper; untested, and this path has never fired.)
 
 ## Follow-ups
 

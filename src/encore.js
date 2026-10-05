@@ -401,8 +401,10 @@ async function encore({ github, context, core, inputs = {} }) {
   }
 
   // Opt-in fallback for exactly that case: re-run the whole run, passed jobs
-  // included. More expensive, but it is the only primitive that can start an
-  // attempt when there is nothing GitHub calls a failed job.
+  // included. More expensive, but it does start an attempt when there is nothing
+  // GitHub calls a failed job. (Re-running the cancelled jobs individually via
+  // actions/jobs/{job_id}/rerun might also work and would be cheaper; untested
+  // for this case, and this path has never fired -- see docs/design.md.)
   try {
     await github.rest.actions.reRunWorkflow({ owner, repo, run_id: runId });
   } catch (error) {
