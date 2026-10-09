@@ -151,8 +151,16 @@ jobs:
             /** A 60-shard matrix should not open 60 concurrent log downloads. */
             const MAX_CONCURRENCY = 8;
 
-            /** Job logs are scanned from the end: that is where the runner's death lands. */
-            const MAX_LOG_BYTES = 256 * 1024;
+            /**
+             * How much of a job log is decoded and scanned.
+             *
+             * This started as a tail, because the built-in signature is a runner death and
+             * that lands at the very end. `extra_patterns` does not inherit the assumption:
+             * a caller matching a registry flake is matching a line printed where the step
+             * died, which in a 12 MB integration-test log was 120 KB in -- megabytes above any tail
+             * worth holding. So the budget is spent at both ends and the middle is dropped.
+             */
+            const MAX_LOG_BYTES = 8 * 1024 * 1024;
 
             const DEFAULT_MAX_ATTEMPTS = 3;
 
@@ -199,19 +207,22 @@ jobs:
             }
 
             /**
-             * Job logs arrive as a redirect body: string, Buffer or ArrayBuffer. Only the
-             * tail is decoded — enough to hold the runner's last words.
+             * Job logs arrive as a redirect body: string, Buffer or ArrayBuffer. At most
+             * MAX_LOG_BYTES of it is decoded, taken from both ends when the log is bigger
+             * than that -- the runner's last words and the step that died, with only the
+             * middle discarded.
              *
              * This bounds the string we hold and the regex we run over it, not the
              * download: Octokit has already buffered the whole response by the time we get
              * here. Capping that would need a Range header or a streamed fetch of the
-             * redirect target. Job logs are rarely large enough for it to matter, and
-             * MAX_CONCURRENCY bounds how many are in memory at once.
+             * redirect target. MAX_CONCURRENCY bounds how many are in memory at once.
              */
-            function decodeTail(data, maxBytes = MAX_LOG_BYTES) {
+            function decodeScanWindow(data, maxBytes = MAX_LOG_BYTES) {
+              const half = Math.floor(maxBytes / 2);
               if (data === undefined || data === null) return '';
               if (typeof data === 'string') {
-                return data.length > maxBytes ? data.slice(-maxBytes) : data;
+                if (data.length <= maxBytes) return data;
+                return `${data.slice(0, half)}\n${data.slice(-half)}`;
               }
               if (typeof Buffer !== 'undefined') {
                 let buffer = null;
@@ -221,8 +232,10 @@ jobs:
                   buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
                 }
                 if (buffer) {
-                  const tail = buffer.length > maxBytes ? buffer.subarray(buffer.length - maxBytes) : buffer;
-                  return tail.toString('utf8');
+                  if (buffer.length <= maxBytes) return buffer.toString('utf8');
+                  const head = buffer.subarray(0, half).toString('utf8');
+                  const tail = buffer.subarray(buffer.length - half).toString('utf8');
+                  return `${head}\n${tail}`;
                 }
               }
               return String(data);
@@ -251,7 +264,7 @@ jobs:
                 repo,
                 job_id: jobId,
               });
-              return decodeTail(response && response.data);
+              return decodeScanWindow(response && response.data);
             }
 
             /**
@@ -276,10 +289,10 @@ jobs:
                 source: 'annotations',
               };
 
-              let classified = false;
+              let annotated = false;
               try {
                 verdict.infra = matches(await readAnnotations({ github, owner, repo, jobId: job.id }));
-                classified = true;
+                annotated = true;
               } catch (error) {
                 const status = statusOf(error);
                 if (!ANNOTATIONS_UNAVAILABLE.includes(status)) throw error;
@@ -288,17 +301,35 @@ jobs:
                 );
               }
 
-              if (!classified) {
+              // The annotations are a summary, not the evidence. A step that exits nonzero
+              // annotates "Process completed with exit code 2" and nothing else, so a
+              // signature that only ever appears in step output — a registry flake, an
+              // OOM line — is invisible here, and the job is about to be called genuine,
+              // which withdraws the retry every other candidate in the run had earned. The
+              // log is worth one download before making that call.
+              //
+              // `failure` only. A cancelled job keeps annotations-only semantics: its log
+              // is full of the cancellation text that extra_patterns most often matches,
+              // and a fail-fast sibling — or a human-cancelled run — must not be able to
+              // read its own cancellation back as grounds for a retry.
+              if (!verdict.infra && (!annotated || job.conclusion === 'failure')) {
                 try {
-                  verdict.source = 'logs';
                   verdict.infra = matches(await readLogs({ github, owner, repo, jobId: job.id }));
+                  verdict.source = verdict.infra || !annotated ? 'logs' : 'annotations+logs';
                 } catch (error) {
-                  verdict.source = 'unreadable';
-                  verdict.infra = false;
-                  core.warning(
-                    `could not read annotations or logs for job "${job.name}" (${error.message}); ` +
-                      'assuming no infra evidence',
-                  );
+                  if (!annotated) {
+                    verdict.source = 'unreadable';
+                    verdict.infra = false;
+                    core.warning(
+                      `could not read annotations or logs for job "${job.name}" (${error.message}); ` +
+                        'assuming no infra evidence',
+                    );
+                  } else {
+                    core.warning(
+                      `could not read logs for job "${job.name}" (${error.message}); ` +
+                        'classifying on its annotations alone',
+                    );
+                  }
                 }
               }
 
