@@ -248,15 +248,16 @@ test('scans every annotation on a job, not just the first', async () => {
   assert.equal(result.decision, 'retried');
 });
 
-test('treats a failed job with no annotations as a genuine failure', async () => {
-  const { result, calls } = await invoke({
+test('treats a failed job with no evidence anywhere as a genuine failure', async () => {
+  const { result } = await invoke({
     run: completedRun(1),
     jobs: [job(1, 'build', 'failure')],
     annotations: {},
+    logs: { 1: Buffer.from(`${GENUINE}\n`) },
   });
 
   assert.equal(result.decision, 'genuine_failure');
-  assert.deepEqual(calls.logs, []);
+  assert.equal(result.verdicts[0].source, 'annotations+logs');
 });
 
 test('retries a cancelled job that lost communication', async () => {
@@ -350,6 +351,62 @@ for (const status of [403, 404, 410]) {
   });
 }
 
+// The annotations are a summary of the job, not its output. A step that exits
+// nonzero annotates "Process completed with exit code 2" and nothing else, so a
+// signature that only ever appears in step output is invisible there — and
+// calling the job genuine on that basis withdraws the retry its preempted
+// siblings earned.
+const EXIT_2 = { annotation_level: 'failure', message: 'Process completed with exit code 2.' };
+const REGISTRY_FLAKE = 'error pulling image configuration: download failed after attempts=1: unknown blob';
+
+test('escalates to the job log when a failed job\'s annotations match nothing', async () => {
+  const { result, calls } = await invoke(
+    {
+      run: completedRun(1),
+      jobs: [job(1, 'itest', 'failure')],
+      annotations: { 1: [EXIT_2] },
+      logs: { 1: Buffer.from(`${REGISTRY_FLAKE}\n`) },
+    },
+    { extra_patterns: 'error pulling image configuration' },
+  );
+
+  assert.equal(result.decision, 'retried');
+  assert.equal(result.verdicts[0].source, 'logs');
+  assert.deepEqual(calls.logs, [1]);
+});
+
+test('does not escalate to the log for a cancelled job', async () => {
+  // A fail-fast sibling's log is full of the cancellation text that
+  // extra_patterns most often matches. Reading it back would let the
+  // cancellation argue for the retry it is supposed to be neutral about.
+  const { result, calls } = await invoke(
+    {
+      run: completedRun(1),
+      jobs: [job(1, 'shard-2', 'cancelled')],
+      annotations: { 1: [{ message: 'Node.js 20 is deprecated.' }] },
+      logs: { 1: Buffer.from(`${CANCELED}\n`) },
+    },
+    { extra_patterns: 'the operation was canceled' },
+  );
+
+  assert.equal(result.decision, 'no_infra_evidence');
+  assert.equal(result.verdicts[0].verdict, 'inconclusive');
+  assert.deepEqual(calls.logs, []);
+});
+
+test('falls back to the annotations when the escalated log cannot be read', async () => {
+  const { result, logged } = await invoke({
+    run: completedRun(1),
+    jobs: [job(1, 'build', 'failure')],
+    annotations: { 1: [EXIT_2] },
+    logs: {},
+  });
+
+  assert.equal(result.decision, 'genuine_failure');
+  assert.equal(result.verdicts[0].source, 'annotations');
+  assert.match(logged.warning.join('\n'), /classifying on its annotations alone/);
+});
+
 test('reads logs delivered as an ArrayBuffer', async () => {
   const bytes = new TextEncoder().encode(LOST_COMMUNICATION);
   const { result } = await invoke({
@@ -374,15 +431,30 @@ test('scans the tail of a very large log', async () => {
   assert.equal(result.decision, 'retried');
 });
 
-test('does not read an unbounded log into memory', async () => {
-  // The bound is the point, so the false negative it implies is asserted here
-  // rather than discovered later: a message buried megabytes above the end of
-  // the log is out of scope.
+test('scans the head of a very large log', async () => {
+  // The observed geometry: the signature is printed where the step died, 120 KB
+  // into a 12 MB log, with megabytes of passing tests after it. A tail-only
+  // window missed it entirely.
   const { result } = await invoke({
     run: completedRun(1),
     jobs: [job(1, 'build', 'failure')],
     annotations: { 1: httpError(404) },
-    logs: { 1: Buffer.from(`${LOST_COMMUNICATION}\n${'x'.repeat(2 * MAX_LOG_BYTES)}`) },
+    logs: { 1: Buffer.from(`${LOST_COMMUNICATION}\n${'x'.repeat(4 * MAX_LOG_BYTES)}`) },
+  });
+
+  assert.equal(result.decision, 'retried');
+});
+
+test('does not read an unbounded log into memory', async () => {
+  // The bound is the point, so the false negative it implies is asserted here
+  // rather than discovered later: both ends are scanned, and a message buried
+  // in the middle of an oversized log is out of scope.
+  const filler = 'x'.repeat(MAX_LOG_BYTES);
+  const { result } = await invoke({
+    run: completedRun(1),
+    jobs: [job(1, 'build', 'failure')],
+    annotations: { 1: httpError(404) },
+    logs: { 1: Buffer.from(`${filler}\n${LOST_COMMUNICATION}\n${filler}`) },
   });
 
   assert.equal(result.decision, 'genuine_failure');

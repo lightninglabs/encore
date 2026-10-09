@@ -364,17 +364,36 @@ verify` fails if the generated copy drifts, and the test suite compiles the inli
   it re-executes work that succeeded; it never fires when any candidate ended `failure`.
 - **Bounded work.** Classification runs at most 8 jobs concurrently, so a 60-shard matrix does not
   open 60 paginated annotation reads (or, on the log fallback, 60 concurrent log downloads) at
-  once. Only the last 256 KiB of a job log is decoded and scanned — the runner's last words are at
-  the end. That bounds the string and the regex, not the download: Octokit has already buffered the
-  response by then, and capping it would need a `Range` header or a streamed fetch of the redirect
-  target. Concurrency is what keeps those buffers from piling up.
+  once. At most 8 MiB of a job log is decoded and scanned, taken from both ends when the log is
+  bigger than that. That bounds the string and the regex, not the download: Octokit has already
+  buffered the response by then, and capping it would need a `Range` header or a streamed fetch of
+  the redirect target. Concurrency is what keeps those buffers from piling up.
   And because the rule is all-or-nothing, classification stops as soon as one job scores
   `genuine`; the common case is a real test failure, and there is no reason to pay for the rest of
   the matrix. The count of unexamined candidates is logged rather than left implicit.
 - **The annotation fallback from §8 is implemented, not deferred.** If `checks.listAnnotations`
   returns 403/404/410 the job log is scanned for the same string, and the verdict records which
-  source answered (`annotations`, `logs`, or `unreadable`). Anything unreadable scores as no
-  evidence: the expensive mistake is retrying a run that will fail again.
+  source answered (`annotations`, `logs`, `annotations+logs`, or `unreadable`). Anything unreadable
+  scores as no evidence: the expensive mistake is retrying a run that will fail again.
+- **The log is read on the way to `genuine`, not only when annotations 404.** Measured on an
+  adopting repo: a container image pull failed transiently, the registry error landed in the step
+  output, the step exited 2, and the *only* annotation on the job was
+  `Process completed with exit code 2.`. The
+  annotations are a summary of the job, not its output — any signature that lives solely in step
+  output is invisible to them, and `extra_patterns` could not reach it. encore ruled the job
+  `genuine`, which under the all-or-nothing rule withdrew the retry a genuinely preempted sibling
+  had earned in the same run.
+
+  So a **failed** job whose annotations match nothing now has its log downloaded and matched before
+  the `genuine` verdict is issued. The cost is one extra call on the path that was about to decline
+  anyway. Cancelled jobs are excluded on purpose: a fail-fast sibling's log contains the
+  cancellation text `extra_patterns` most often carries, and reading it back would let a
+  cancellation argue for the retry it exists to stay neutral about.
+
+  The scan window moved with it. 256 KiB of tail was sized for a runner death, which lands at the
+  very end; that registry error was ~120 KB into an ~12 MB log, with megabytes of passing tests
+  after it. The budget is now 8 MiB split between head and tail, so both the last words and the step that
+  died are in scope and only the middle is dropped.
 - **`dry_run`.** Logs the verdict and never calls `rerun-failed-jobs`, so a team can watch the
   decisions for a week before spending compute on them.
 - **Two attempt fields, not one.** `examined_attempt` is the attempt that was classified,

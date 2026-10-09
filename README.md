@@ -120,7 +120,7 @@ on re-runs.
 | `run_id` | — | The completed run to examine. Required. |
 | `max_attempts` | `3` | Total attempts, not extra ones: `3` is the original run plus two retries. |
 | `dry_run` | `false` | Classify and log, never re-run. |
-| `extra_patterns` | `''` | Extra case-insensitive regexes, one per line, that also mark a job as infrastructure. Blank lines and `#` comments ignored. |
+| `extra_patterns` | `''` | Extra case-insensitive regexes, one per line, that also mark a job as infrastructure. Matched against the job's annotations, and — for a job that *failed* — its log. Blank lines and `#` comments ignored. |
 | `rerun_all_fallback` | `false` | If `rerun-failed-jobs` is refused because no candidate ended `failure`, re-run the whole run instead — passed jobs included. See [Cancelled jobs and re-runnability](#cancelled-jobs-and-re-runnability). |
 | `token` (secret) / `github_token` (action) | `GITHUB_TOKEN` | Needs `actions: write` and `checks: read`. |
 
@@ -150,6 +150,26 @@ The run is re-run when at least one candidate is `infra` and none is `genuine`:
 | `attempt_cap` | `run_attempt` has reached `max_attempts`. |
 | `rerun_rejected` | GitHub refused the re-run — already re-run by hand, aged out of the retention window, or no failed job to re-run. Warned, not failed. |
 | `run_incomplete` | The run is not `completed`, so it is not re-runnable. |
+
+### Annotations first, then the log
+
+Annotations are checked first: they are one cheap call and the preemption signature lands there
+verbatim. But they are a summary of the job, not its output. A step that exits nonzero annotates
+`Process completed with exit code 2.` and nothing else, so a signature that only ever appears in
+step output — a registry flake, an OOM line — is invisible there.
+
+That matters because of the all-or-nothing rule. A job called `genuine` on the strength of
+`exit code 2` withdraws the retry every preempted job in the same run had earned. So before a
+**failed** job is called genuine, its log is downloaded and matched too. One extra call, on the
+path that was about to decline anyway.
+
+Cancelled jobs are deliberately left out of this. A fail-fast sibling's log is full of the
+cancellation text that `extra_patterns` most often carries, and reading it back would let the
+cancellation argue for a retry it is supposed to be neutral about.
+
+Up to 8 MiB of each log is scanned. If a log is larger, the budget is split between its head and
+its tail and the middle is dropped — the runner's last words are at the end, but a flake is
+printed wherever the step died, which in a 12 MB integration-test log was 120 KB in.
 
 Cancellations are deliberately neutral. `fail-fast` cancels the siblings of a preempted job, and
 those cancellations say nothing about why the run died — so they must not veto the retry the
@@ -210,8 +230,9 @@ event, which lands right back here, and the cap is what stops that recurring.
   Notice: 1 of 2 candidate job(s) look genuine (unit-tests); not retrying
   ```
 
-  `source` is `annotations` normally, `logs` if the annotations endpoint was unavailable and the
-  log fallback ran, `unreadable` if neither could be read.
+  `source` says where the verdict came from: `annotations` if they settled it, `logs` if the
+  evidence was in the job log, `annotations+logs` if both were read and neither matched, and
+  `unreadable` if nothing could be read.
 
 ## Companion change: escalate retries to on-demand
 
@@ -243,7 +264,10 @@ absorbed in-process is one that never reaches encore.
   lost. encore will occasionally re-run such a job. Cost only, not correctness.
 - **Job id as check-run id.** The annotations endpoint is reached with the job id, an
   undocumented-but-stable correspondence. If it breaks, `checks.listAnnotations` starts 404ing;
-  encore warns and falls back to scanning the job log for the same string (`source=logs`).
+  encore warns and classifies from the job log alone (`source=logs`).
+- **The log scan has a middle it cannot see.** Both ends of an oversized log are scanned, but a
+  signature more than 4 MiB from either end is missed. Raising `MAX_LOG_BYTES` is the lever; it
+  is bounded because Octokit buffers the whole log before encore sees it.
 - **Whether a cancelled job is re-runnable at all.** `rerun-failed-jobs` may refuse a run whose
   only candidates ended `cancelled`, on the grounds that it has no failed jobs. encore reports
   that case with its own message rather than blaming the retention window, and
